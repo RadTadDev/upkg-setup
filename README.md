@@ -20,7 +20,7 @@ Add this folder to your `PATH`, then from the directory you want the repo create
 upkg
 upkg "Name Of Package"
 upkg --unity 6000.0.23f1   # pin a specific editor instead of the newest installed
-upkg --offline             # generate + commit locally, skip GitHub
+upkg --local               # create + commit locally, don't create the GitHub repo yet
 ```
 
 Or run it directly with `py upkg.py`.
@@ -44,8 +44,12 @@ project is pinned to the newest Unity editor installed through Unity Hub.
 ```
 <repo>/
 ├── .gitignore, LICENSE, README.md
-├── ProjectSettings/ProjectVersion.txt     (pins the editor for Unity Hub)
-├── Packages/manifest.json                 (editor defaults + Test Framework)
+├── ProjectSettings/
+│   ├── ProjectVersion.txt                 (pins the editor for Unity Hub)
+│   ├── ProjectSettings.asset              (from the editor's Hub template: Input System, etc.)
+│   └── PackageManagerSettings.asset       (avoids a Package Manager error on first open)
+├── Packages/manifest.json                 (editor defaults, Input System, uGUI, IDE support,
+│                                           Test Framework)
 └── Assets/
     └── <PackageFolder>/                   (package root, installed via ?path=)
         ├── package.json

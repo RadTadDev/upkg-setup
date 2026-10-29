@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import uuid
 from pathlib import Path
 
@@ -122,14 +123,13 @@ def gh_json(*endpoint_args):
         return None
 
 
-def require_tools(need_gh):
+def require_tools():
     if not shutil.which("git"):
         die("git was not found on PATH.")
-    if need_gh:
-        if not shutil.which("gh"):
-            die("GitHub CLI (gh) was not found on PATH. Install it from https://cli.github.com/")
-        if run(["gh", "auth", "status"], check=False).returncode != 0:
-            die("gh is not authenticated. Run `gh auth login` first.")
+    if not shutil.which("gh"):
+        die("GitHub CLI (gh) was not found on PATH. Install it from https://cli.github.com/")
+    if run(["gh", "auth", "status"], check=False).returncode != 0:
+        die("gh is not authenticated. Run `gh auth login` first.")
 
 
 # ---------------------------------------------------------------------------
@@ -194,10 +194,22 @@ def installed_unity_editors():
     return {v: editors[v] for v in sorted(editors, key=key, reverse=True)}
 
 
+# Packages a Unity Hub template project gets on top of the editor's built-in modules
+# (minus template content like URP and Timeline). Test Framework is what the generated
+# test assemblies need; Input System matches the template's input setting below.
+DEV_PROJECT_PACKAGES = (
+    "com.unity.ide.rider",
+    "com.unity.ide.visualstudio",
+    "com.unity.inputsystem",
+    "com.unity.test-framework",
+    "com.unity.ugui",
+)
+
+
 def default_project_manifest(editor_dir):
-    """Packages/manifest.json Unity would create for a new project, plus the Test
-    Framework (which Unity leaves out, but the generated test assemblies need).
-    Returns None if the editor's package metadata can't be read."""
+    """Packages/manifest.json for a new project: the editor's default modules plus
+    DEV_PROJECT_PACKAGES at the versions this editor recommends. Returns None if
+    the editor's package metadata can't be read."""
     path = editor_dir / "Editor" / "Data" / "Resources" / "PackageManager" / "Editor" / "manifest.json"
     try:
         packages = json.loads(path.read_text(encoding="utf-8"))["packages"]
@@ -205,11 +217,33 @@ def default_project_manifest(editor_dir):
         return None
     deps = {name: p["version"] for name, p in packages.items()
             if p.get("isDefault") and "version" in p}
-    test_fw = packages.get("com.unity.test-framework", {}).get("version")
-    if not deps or not test_fw:
-        return None
-    deps["com.unity.test-framework"] = test_fw
+    for name in DEV_PROJECT_PACKAGES:
+        version = packages.get(name, {}).get("version")
+        if not version:
+            return None
+        deps[name] = version
     return {"dependencies": dict(sorted(deps.items()))}
+
+
+def template_player_settings(editor_dir, company, product):
+    """ProjectSettings.asset from the editor's bundled Unity Hub template, so new
+    projects get the same player settings as one made in Hub (e.g. the Input
+    System instead of the deprecated Input Manager). Returns None if unavailable."""
+    templates = editor_dir / "Editor" / "Data" / "Resources" / "PackageManager" / "ProjectTemplates"
+    candidates = sorted(templates.glob("com.unity.template.*.tgz"),
+                        key=lambda p: ("3d-cross-platform" not in p.name, "3d" not in p.name))
+    member = "package/ProjectData~/ProjectSettings/ProjectSettings.asset"
+    for tgz in candidates:
+        try:
+            with tarfile.open(tgz) as archive:
+                text = archive.extractfile(member).read().decode("utf-8")
+        except (OSError, KeyError, AttributeError, tarfile.TarError):
+            continue
+        for key, value in (("productGUID", uuid.uuid4().hex),
+                           ("companyName", company), ("productName", product)):
+            text = re.sub(rf"(?m)^(  {key}: ).*$", lambda m: m.group(1) + value, text)
+        return text
+    return None
 
 
 def gh_owners():
@@ -296,6 +330,55 @@ crashlytics-build.properties
 .DS_Store
 Thumbs.db
 """
+
+# Unity writes this during a project's first session. Without it, the first open throws a
+# NullReferenceException in the Package Manager window's scoped-registry sidebar.
+PACKAGE_MANAGER_SETTINGS = """\
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &1
+MonoBehaviour:
+  m_ObjectHideFlags: 61
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 13964, guid: 0000000000000000e000000000000000, type: 0}
+  m_Name:
+  m_EditorClassIdentifier:
+  m_EnablePreviewPackages: 0
+  m_EnablePackageDependencies: 0
+  m_AdvancedSettingsExpanded: 1
+  m_ScopedRegistriesSettingsExpanded: 1
+  oneTimeWarningShown: 0
+  m_Registries:
+  - m_Id: main
+    m_Name:
+    m_Url: https://packages.unity.com
+    m_Scopes: []
+    m_IsDefault: 1
+    m_Capabilities: 7
+  m_UserSelectedRegistryName:
+  m_UserAddingNewScopedRegistry: 0
+  m_RegistryInfoDraft:
+    m_ErrorMessage:
+    m_Original:
+      m_Id:
+      m_Name:
+      m_Url:
+      m_Scopes: []
+      m_IsDefault: 0
+      m_Capabilities: 0
+    m_Modified: 0
+    m_Name:
+    m_Url:
+    m_Scopes:
+    -
+    m_SelectedScopeIndex: 0
+"""
+
 
 def render(template, **values):
     for k, v in values.items():
@@ -386,6 +469,10 @@ def build_files(cfg):
         files["ProjectSettings/ProjectVersion.txt"] = f"m_EditorVersion: {cfg['unity_editor']}\n"
     if cfg["project_manifest"]:
         files["Packages/manifest.json"] = json.dumps(cfg["project_manifest"], indent=2) + "\n"
+    if cfg["player_settings"]:
+        files["ProjectSettings/ProjectSettings.asset"] = cfg["player_settings"]
+    if cfg["unity_editor"]:
+        files["ProjectSettings/PackageManagerSettings.asset"] = PACKAGE_MANAGER_SETTINGS
     return files
 
 
@@ -640,18 +727,16 @@ namespace {{ns}}.Samples
 # ---------------------------------------------------------------------------
 
 def pick_unity_editor(requested):
-    """Newest installed editor unless one was requested. Returns (version, manifest)."""
+    """Newest installed editor unless one was requested. Returns (version, editor_dir);
+    editor_dir is None when that version isn't installed."""
     editors = installed_unity_editors()
     if requested:
         if not UNITY_FULL_RE.match(requested):
             die(f"'{requested}' is not a full editor version, e.g. 6000.0.23f1.")
-        version = requested
-    elif editors:
-        version = next(iter(editors))
-    else:
-        return None, None
-    manifest = default_project_manifest(editors[version]) if version in editors else None
-    return version, manifest
+        return requested, editors.get(requested)
+    if editors:
+        return next(iter(editors.items()))
+    return None, None
 
 
 def gather(args):
@@ -660,34 +745,29 @@ def gather(args):
     if cfg["path"].exists():
         die(f"{cfg['path']} already exists.")
 
-    if args.offline:
-        user = {"login": "owner", "name": None}
-        cfg["owner"] = "owner"
-    else:
-        user, owners = gh_owners()
-        labels = [(o, f"{o} (personal)" if i == 0 else o) for i, o in enumerate(owners)]
-        cfg["owner"] = choose("Create the repo under", labels)
+    user, owners = gh_owners()
+    labels = [(o, f"{o} (personal)" if i == 0 else o) for i, o in enumerate(owners)]
+    cfg["owner"] = choose("Create the repo under", labels)
 
     cfg["visibility"] = choose("Visibility", [("private", "Private"), ("public", "Public")])
 
-    licenses = [("mit", "MIT License")] if args.offline else gh_licenses()
-    lic_options = licenses + [(None, "None (all rights reserved)")]
+    lic_options = gh_licenses() + [(None, "None (all rights reserved)")]
     default_lic = next((i for i, (k, _) in enumerate(lic_options) if k == "mit"), 0)
     cfg["license_key"] = choose("License", lic_options, default_lic)
 
-    cfg["unity_editor"], cfg["project_manifest"] = pick_unity_editor(args.unity)
+    cfg["unity_editor"], editor_dir = pick_unity_editor(args.unity)
     cfg["unity_min"] = (".".join(cfg["unity_editor"].split(".")[:2])
                         if cfg["unity_editor"] else "2022.3")
     cfg["author_name"] = user.get("name") or cfg["owner"]
+    cfg["project_manifest"] = default_project_manifest(editor_dir) if editor_dir else None
+    cfg["player_settings"] = (template_player_settings(editor_dir, NAMESPACE_ROOT,
+                                                       cfg["display_name"])
+                              if editor_dir else None)
 
     year = datetime.date.today().year
     if cfg["license_key"]:
-        if args.offline:
-            cfg["license_spdx"] = "MIT"
-            cfg["license_body"] = f"MIT License\n\nCopyright (c) {year} {cfg['author_name']}\n"
-        else:
-            cfg["license_spdx"], cfg["license_body"] = license_text(
-                cfg["license_key"], year, cfg["author_name"])
+        cfg["license_spdx"], cfg["license_body"] = license_text(
+            cfg["license_key"], year, cfg["author_name"])
     else:
         cfg["license_spdx"] = None
         cfg["license_body"] = f"Copyright (c) {year} {cfg['author_name']}. All rights reserved.\n"
@@ -719,20 +799,23 @@ def create(cfg, args):
     run(["git", "add", "-A"], cwd=root)
     run(["git", "commit", "-m", f"Initial {cfg['display_name']} package structure"], cwd=root)
 
-    if not args.offline:
+    url = f"https://github.com/{cfg['owner']}/{cfg['repo']}"
+    cmd = ["gh", "repo", "create", f"{cfg['owner']}/{cfg['repo']}", f"--{cfg['visibility']}",
+           "--source", ".", "--remote", "origin", "--push"]
+    if not args.local:
         step("Creating GitHub repository")
-        cmd = ["gh", "repo", "create", f"{cfg['owner']}/{cfg['repo']}", f"--{cfg['visibility']}",
-               "--source", ".", "--remote", "origin", "--push"]
         if run(cmd, cwd=root, check=False, capture=False).returncode != 0:
             die(f"gh repo create failed. The local repo is intact at {root}; retry with:\n"
                 f"  cd \"{root}\"\n  {subprocess.list2cmdline(cmd)}")
 
     step("Done")
-    if not args.offline:
-        url = f"https://github.com/{cfg['owner']}/{cfg['repo']}"
+    info(f"Local:       {root}")
+    if args.local:
+        info("To publish to GitHub later, run from that folder:")
+        info(f"  {subprocess.list2cmdline(cmd)}")
+    else:
         info(f"Repo:        {url}")
         info(f"Install URL: {url}.git?path=/Assets/{cfg['folder']}")
-    info(f"Local:       {root}")
     if not cfg["project_manifest"]:
         info("Add the Test Framework package (Package Manager) so the test assemblies compile.")
 
@@ -743,12 +826,12 @@ def main():
         description="Create a GitHub repo pre-structured as a Unity package.")
     parser.add_argument("name", nargs="?", help='package name, e.g. "Name Of Package"')
     parser.add_argument("--unity", help="editor version to pin (default: newest installed)")
-    parser.add_argument("--offline", action="store_true",
-                        help="generate and commit locally only; don't call GitHub")
+    parser.add_argument("--local", action="store_true",
+                        help="create and commit the repo locally; don't create it on GitHub")
     parser.add_argument("-y", "--yes", action="store_true", help="skip the final confirmation")
     args = parser.parse_args()
 
-    require_tools(need_gh=not args.offline)
+    require_tools()
     try:
         cfg = gather(args)
         summarize(cfg)
