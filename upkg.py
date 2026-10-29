@@ -20,8 +20,11 @@ import sys
 import uuid
 from pathlib import Path
 
+# Every package is named <PACKAGE_DOMAIN>.<name> with code in <NAMESPACE_ROOT>.<Name>.
+PACKAGE_DOMAIN = "com.radtaddev"
+NAMESPACE_ROOT = "RadTadDev"
+INITIAL_VERSION = "0.1.0"
 UNITY_HUB_EDITOR_DIR = Path(r"C:\Program Files\Unity\Hub\Editor")
-DEFAULT_VERSION = "0.1.0"
 
 
 # ---------------------------------------------------------------------------
@@ -133,80 +136,37 @@ def require_tools(need_gh):
 # Naming helpers
 # ---------------------------------------------------------------------------
 
-REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
-FOLDER_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-PACKAGE_ID_RE = re.compile(r"^[a-z0-9_-]+(\.[a-z0-9_-]+){2,}$")
-NAMESPACE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
-SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$")
-UNITY_MIN_RE = re.compile(r"^\d{4}\.\d+$")
 UNITY_FULL_RE = re.compile(r"^\d{4}\.\d+\.\d+[abfp]\d+$")
 
 
-def pascal(text):
-    """'my-cool_tool' -> 'MyCoolTool'; 'MyCoolTool' stays as is."""
-    words = re.split(r"[^A-Za-z0-9]+", text)
-    out = "".join(w[:1].upper() + w[1:] for w in words if w)
-    if out and out[0].isdigit():
-        out = "_" + out
-    return out
+def split_words(text):
+    """'Name Of Package' / 'name-of-package' / 'NameOfPackage' -> ['name', 'of', 'package']."""
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+    text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", text)
+    return [w.lower() for w in re.split(r"[^A-Za-z0-9]+", text) if w]
 
 
-def kebab(text):
-    """'MyCoolTool' / 'my_cool tool' -> 'my-cool-tool'."""
-    text = re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", text)
-    text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1-\2", text)
-    text = re.sub(r"[^A-Za-z0-9]+", "-", text)
-    return text.strip("-").lower()
+def derive_names(text):
+    words = split_words(text)
+    pascal = "".join(w.capitalize() for w in words)
+    return {
+        "repo": "-".join(words),                                  # name-of-package
+        "display_name": " ".join(w.capitalize() for w in words),  # Name Of Package
+        "package_id": f"{PACKAGE_DOMAIN}.{''.join(words)}",       # com.radtaddev.nameofpackage
+        "folder": pascal,                                         # Assets/NameOfPackage
+        "namespace": f"{NAMESPACE_ROOT}.{pascal}",                # RadTadDev.NameOfPackage
+    }
 
 
-def without_unity(slug):
-    """Drop 'unity' segments, which Unity forbids in package names."""
-    return "-".join(p for p in slug.split("-") if "unity" not in p) or "package"
-
-
-def title_words(text):
-    return " ".join(w[:1].upper() + w[1:] for w in kebab(text).split("-") if w)
-
-
-def validate_repo_name(v):
-    if not REPO_NAME_RE.match(v):
-        return "Use letters, digits, '.', '-' or '_' (max 100 chars)."
-    return None
-
-
-def validate_package_id(v):
-    if not PACKAGE_ID_RE.match(v):
-        return ("Use reverse-domain form, e.g. com.company.package-name "
-                "(lowercase letters, digits, '-', '_', '.').")
-    if v.startswith("com.unity") or "unity" in v:
+def validate_name(text):
+    words = split_words(text)
+    if not words:
+        return "Use letters and digits, e.g. 'Name Of Package'."
+    if words[0][0].isdigit():
+        return "The name must start with a letter (it becomes a C# namespace)."
+    if "unity" in "".join(words):
         return "Unity forbids 'unity' anywhere in third-party package names."
-    if len(v) > 214:
-        return "Package names are limited to 214 characters."
     return None
-
-
-def validate_folder(v):
-    if not FOLDER_RE.match(v):
-        return "Use letters, digits, '.', '-' or '_' (no spaces; it goes in the install URL)."
-    if v.endswith("~"):
-        return "Folders ending in '~' are ignored by Unity."
-    return None
-
-
-def validate_namespace(v):
-    return None if NAMESPACE_RE.match(v) else "Not a valid C# namespace."
-
-
-def validate_semver(v):
-    return None if SEMVER_RE.match(v) else "Use semantic versioning, e.g. 0.1.0."
-
-
-def validate_unity_min(v):
-    return None if UNITY_MIN_RE.match(v) else "Use major.minor, e.g. 2022.3 or 6000.0."
-
-
-def validate_unity_full(v):
-    return None if UNITY_FULL_RE.match(v) else "Use a full editor version, e.g. 6000.0.23f1."
 
 
 # ---------------------------------------------------------------------------
@@ -337,22 +297,6 @@ crashlytics-build.properties
 Thumbs.db
 """
 
-GITATTRIBUTES = """\
-* text=auto
-
-*.cs      text diff=csharp
-*.asmdef  text
-*.asmref  text
-*.json    text
-*.md      text
-*.meta    text
-*.unity   text merge=unityyamlmerge
-*.prefab  text merge=unityyamlmerge
-*.asset   text merge=unityyamlmerge
-*.mat     text merge=unityyamlmerge
-"""
-
-
 def render(template, **values):
     for k, v in values.items():
         template = template.replace("{{" + k + "}}", str(v))
@@ -381,31 +325,27 @@ def build_files(cfg):
     """Return {relative_path: content} for the whole repo."""
     pkg = f"Assets/{cfg['folder']}"
     ns = cfg["namespace"]
-    asm = cfg["assembly"]
+    asm = cfg["namespace"]
     short = cfg["package_id"].rsplit(".", 1)[-1]
     repo_url = f"https://github.com/{cfg['owner']}/{cfg['repo']}"
     blob = f"{repo_url}/blob/main/{pkg}"
     git_url = f"{repo_url}.git?path=/{pkg}"
-    cls = pascal(cfg["folder"])
-    v = dict(display=cfg["display_name"], description=cfg["description"], ns=ns,
-             cls=cls, package_id=cfg["package_id"], git_url=git_url, version=cfg["version"],
-             unity=cfg["unity_min"], editor=cfg["unity_editor"] or cfg["unity_min"],
-             pkg=pkg, short=short, date=datetime.date.today().isoformat(),
-             author=cfg["author_name"])
+    cls = cfg["folder"]
+    v = dict(display=cfg["display_name"], ns=ns, cls=cls, package_id=cfg["package_id"],
+             git_url=git_url, version=INITIAL_VERSION, unity=cfg["unity_min"],
+             editor=cfg["unity_editor"] or cfg["unity_min"], pkg=pkg, short=short,
+             date=datetime.date.today().isoformat())
 
     manifest = {
         "name": cfg["package_id"],
-        "version": cfg["version"],
+        "version": INITIAL_VERSION,
         "displayName": cfg["display_name"],
-        "description": cfg["description"],
+        "description": "",
         "unity": cfg["unity_min"],
-        "author": {k: val for k, val in (("name", cfg["author_name"]),
-                                         ("email", cfg["author_email"]),
-                                         ("url", cfg["author_url"])) if val},
+        "author": {"name": cfg["author_name"], "url": f"https://github.com/{cfg['owner']}"},
         "documentationUrl": f"{repo_url}#readme",
         "changelogUrl": f"{blob}/CHANGELOG.md",
         "licensesUrl": f"{blob}/LICENSE.md",
-        "keywords": cfg["keywords"],
         "dependencies": {},
         "samples": [{
             "displayName": "Example",
@@ -418,7 +358,6 @@ def build_files(cfg):
 
     files = {
         ".gitignore": GITIGNORE,
-        ".gitattributes": GITATTRIBUTES,
         "LICENSE": cfg["license_body"],
         "README.md": render(ROOT_README, **v),
         f"{pkg}/package.json": json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
@@ -533,8 +472,6 @@ def write_repo(root, files):
 ROOT_README = """\
 # {{display}}
 
-{{description}}
-
 ## Installation
 
 In Unity, open **Window > Package Manager**, click **+ > Add package from git URL...** and enter:
@@ -579,8 +516,6 @@ through the Package Manager or edit them outside the editor.
 PKG_README = """\
 # {{display}}
 
-{{description}}
-
 `{{package_id}}` &middot; see the repository README for installation and development notes.
 
 ## Layout
@@ -619,8 +554,6 @@ This package contains no third-party software.
 
 DOCS_MD = """\
 # {{display}}
-
-{{description}}
 
 ## Getting started
 
@@ -706,84 +639,46 @@ namespace {{ns}}.Samples
 # Main flow
 # ---------------------------------------------------------------------------
 
-def gather(args):
-    cfg = {}
+def pick_unity_editor(requested):
+    """Newest installed editor unless one was requested. Returns (version, manifest)."""
+    editors = installed_unity_editors()
+    if requested:
+        if not UNITY_FULL_RE.match(requested):
+            die(f"'{requested}' is not a full editor version, e.g. 6000.0.23f1.")
+        version = requested
+    elif editors:
+        version = next(iter(editors))
+    else:
+        return None, None
+    manifest = default_project_manifest(editors[version]) if version in editors else None
+    return version, manifest
 
-    step("Repository")
-    cfg["repo"] = ask("Repository name", args.name, validate_repo_name)
+
+def gather(args):
+    cfg = derive_names(ask("Package name (e.g. Name Of Package)", args.name, validate_name))
+    cfg["path"] = Path(os.getcwd()).resolve() / cfg["repo"]
+    if cfg["path"].exists():
+        die(f"{cfg['path']} already exists.")
 
     if args.offline:
-        user = {"login": args.owner or "owner", "name": None}
-        cfg["owner"] = ask("Owner", args.owner or "owner")
+        user = {"login": "owner", "name": None}
+        cfg["owner"] = "owner"
     else:
         user, owners = gh_owners()
-        if args.owner and args.owner in owners:
-            cfg["owner"] = args.owner
-        else:
-            labels = [(o, f"{o} (personal)" if i == 0 else o) for i, o in enumerate(owners)]
-            cfg["owner"] = choose("Publish under which account/org?", labels)
-    is_personal = cfg["owner"] == user["login"]
+        labels = [(o, f"{o} (personal)" if i == 0 else o) for i, o in enumerate(owners)]
+        cfg["owner"] = choose("Create the repo under", labels)
 
-    cfg["description"] = ask("Description", f"{title_words(cfg['repo'])} for Unity.")
+    cfg["visibility"] = choose("Visibility", [("private", "Private"), ("public", "Public")])
 
-    vis = [("private", "Private"), ("public", "Public")]
-    if not is_personal:
-        vis.append(("internal", "Internal (enterprise orgs only)"))
-    cfg["visibility"] = choose("Visibility", vis)
-
-    if args.offline:
-        licenses = [("mit", "MIT License")]
-    else:
-        licenses = gh_licenses()
+    licenses = [("mit", "MIT License")] if args.offline else gh_licenses()
     lic_options = licenses + [(None, "None (all rights reserved)")]
     default_lic = next((i for i, (k, _) in enumerate(lic_options) if k == "mit"), 0)
     cfg["license_key"] = choose("License", lic_options, default_lic)
 
-    cfg["issues"] = confirm("Enable issues?", True)
-    cfg["wiki"] = confirm("Enable wiki?", False)
-    cfg["topics"] = confirm("Add GitHub topics 'unity', 'unity-package', 'upm'?", True)
-
-    step("Package")
-    company_slug = without_unity(re.sub(r"[^a-z0-9_-]+", "-", cfg["owner"].lower()).strip("-")) or "company"
-    cfg["display_name"] = ask("Display name", title_words(cfg["repo"]))
-    cfg["package_id"] = ask("Package name",
-                            f"com.{company_slug}.{without_unity(kebab(cfg['repo']))}",
-                            validate_package_id)
-    cfg["folder"] = ask("Folder under Assets/ (package root)", cfg["repo"], validate_folder)
-    cfg["namespace"] = ask("Root namespace / assembly name",
-                           f"{pascal(cfg['owner'])}.{pascal(cfg['folder'])}",
-                           validate_namespace)
-    cfg["assembly"] = cfg["namespace"]
-    cfg["version"] = ask("Initial version", DEFAULT_VERSION, validate_semver)
-
-    editors = installed_unity_editors()
-    if editors:
-        cfg["unity_editor"] = choose(
-            "Unity editor for the dev project",
-            [(e, e) for e in editors] + [("", "Enter another version"), (None, "Don't pin")])
-        if cfg["unity_editor"] == "":
-            cfg["unity_editor"] = ask("Editor version", validate=validate_unity_full)
-    else:
-        cfg["unity_editor"] = ask("Unity editor version for the dev project (blank to skip)",
-                                  validate=validate_unity_full, allow_empty=True) or None
-    cfg["project_manifest"] = None
-    if cfg["unity_editor"] in editors:
-        cfg["project_manifest"] = default_project_manifest(editors[cfg["unity_editor"]])
-    default_min = ".".join(cfg["unity_editor"].split(".")[:2]) if cfg["unity_editor"] else "2022.3"
-    cfg["unity_min"] = ask("Minimum supported Unity version", default_min, validate_unity_min)
-
-    cfg["author_name"] = ask("Author name", user.get("name") or cfg["owner"])
-    cfg["author_email"] = ask("Author email (optional)", user.get("email") or "", allow_empty=True)
-    cfg["author_url"] = ask("Author URL (optional)", f"https://github.com/{cfg['owner']}",
-                            allow_empty=True)
-    cfg["keywords"] = [k.strip() for k in ask(
-        "Keywords (comma separated, optional)", "", allow_empty=True).split(",") if k.strip()]
-
-    step("Location")
-    parent = Path(args.dir or os.getcwd()).resolve()
-    cfg["path"] = Path(ask("Create local repo at", str(parent / cfg["repo"]))).resolve()
-    if cfg["path"].exists() and any(cfg["path"].iterdir()):
-        die(f"{cfg['path']} already exists and is not empty.")
+    cfg["unity_editor"], cfg["project_manifest"] = pick_unity_editor(args.unity)
+    cfg["unity_min"] = (".".join(cfg["unity_editor"].split(".")[:2])
+                        if cfg["unity_editor"] else "2022.3")
+    cfg["author_name"] = user.get("name") or cfg["owner"]
 
     year = datetime.date.today().year
     if cfg["license_key"]:
@@ -803,14 +698,12 @@ def summarize(cfg):
     step("Summary")
     rows = [
         ("Repository", f"{cfg['owner']}/{cfg['repo']} ({cfg['visibility']})"),
-        ("Description", cfg["description"]),
         ("License", cfg["license_spdx"] or "none"),
-        ("Issues / wiki", f"{'on' if cfg['issues'] else 'off'} / {'on' if cfg['wiki'] else 'off'}"),
-        ("Package", f"{cfg['package_id']} {cfg['version']}"),
+        ("Package", cfg["package_id"]),
         ("Display name", cfg["display_name"]),
         ("Package root", f"Assets/{cfg['folder']}"),
         ("Namespace", cfg["namespace"]),
-        ("Unity", f"min {cfg['unity_min']}, editor {cfg['unity_editor'] or 'unpinned'}"),
+        ("Unity", f"{cfg['unity_editor'] or 'unpinned'} (min {cfg['unity_min']})"),
         ("Local path", str(cfg["path"])),
     ]
     width = max(len(k) for k, _ in rows)
@@ -819,44 +712,27 @@ def summarize(cfg):
 
 
 def create(cfg, args):
-    step("Writing files")
     root = cfg["path"]
-    root.mkdir(parents=True, exist_ok=True)
+    root.mkdir(parents=True)
     write_repo(root, build_files(cfg))
-    info(f"Created {root}")
-
-    step("Initializing git")
     run(["git", "init", "-b", "main"], cwd=root)
     run(["git", "add", "-A"], cwd=root)
     run(["git", "commit", "-m", f"Initial {cfg['display_name']} package structure"], cwd=root)
 
-    if args.offline:
-        info("Offline mode: skipped GitHub repository creation.")
-        return
+    if not args.offline:
+        step("Creating GitHub repository")
+        cmd = ["gh", "repo", "create", f"{cfg['owner']}/{cfg['repo']}", f"--{cfg['visibility']}",
+               "--source", ".", "--remote", "origin", "--push"]
+        if run(cmd, cwd=root, check=False, capture=False).returncode != 0:
+            die(f"gh repo create failed. The local repo is intact at {root}; retry with:\n"
+                f"  cd \"{root}\"\n  {subprocess.list2cmdline(cmd)}")
 
-    step("Creating GitHub repository")
-    full = f"{cfg['owner']}/{cfg['repo']}"
-    cmd = ["gh", "repo", "create", full, f"--{cfg['visibility']}",
-           "--description", cfg["description"],
-           "--source", ".", "--remote", "origin", "--push"]
-    if not cfg["issues"]:
-        cmd.append("--disable-issues")
-    if not cfg["wiki"]:
-        cmd.append("--disable-wiki")
-    proc = run(cmd, cwd=root, check=False, capture=False)
-    if proc.returncode != 0:
-        die(f"gh repo create failed. The local repo is intact at {root}; retry with:\n"
-            f"  cd \"{root}\"\n  {subprocess.list2cmdline(cmd)}")
-
-    if cfg["topics"]:
-        run(["gh", "repo", "edit", full, "--add-topic", "unity,unity-package,upm"],
-            cwd=root, check=False)
-
-    url = f"https://github.com/{full}"
     step("Done")
-    info(f"Repo:        {url}")
-    info(f"Install URL: {url}.git?path=/Assets/{cfg['folder']}")
-    info("Next: open the folder in Unity, then commit the generated Packages/ and ProjectSettings/.")
+    if not args.offline:
+        url = f"https://github.com/{cfg['owner']}/{cfg['repo']}"
+        info(f"Repo:        {url}")
+        info(f"Install URL: {url}.git?path=/Assets/{cfg['folder']}")
+    info(f"Local:       {root}")
     if not cfg["project_manifest"]:
         info("Add the Test Framework package (Package Manager) so the test assemblies compile.")
 
@@ -865,9 +741,8 @@ def main():
     _enable_ansi()
     parser = argparse.ArgumentParser(
         description="Create a GitHub repo pre-structured as a Unity package.")
-    parser.add_argument("name", nargs="?", help="repository name")
-    parser.add_argument("--owner", help="GitHub user or org to create the repo under")
-    parser.add_argument("--dir", help="parent directory for the local clone (default: cwd)")
+    parser.add_argument("name", nargs="?", help='package name, e.g. "Name Of Package"')
+    parser.add_argument("--unity", help="editor version to pin (default: newest installed)")
     parser.add_argument("--offline", action="store_true",
                         help="generate and commit locally only; don't call GitHub")
     parser.add_argument("-y", "--yes", action="store_true", help="skip the final confirmation")

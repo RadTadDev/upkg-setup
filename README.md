@@ -2,9 +2,9 @@
 
 Sets up repos to become Unity packages.
 
-`upkg` asks a few questions, scaffolds a Unity project whose `Assets/<PackageFolder>/`
-is a package in [Unity's recommended layout](https://docs.unity3d.com/Manual/cus-layout.html),
-commits it, and publishes it to GitHub with `gh`.
+`upkg` scaffolds a Unity project whose `Assets/<PackageFolder>/` is a package in
+[Unity's recommended layout](https://docs.unity3d.com/Manual/cus-layout.html), commits it,
+and publishes it to GitHub with `gh`.
 
 ## Requirements
 
@@ -18,25 +18,32 @@ Add this folder to your `PATH`, then from the directory you want the repo create
 
 ```
 upkg
-upkg MyCoolTool --owner my-org
-upkg --offline        # generate + commit locally, skip GitHub
+upkg "Name Of Package"
+upkg --unity 6000.0.23f1   # pin a specific editor instead of the newest installed
+upkg --offline             # generate + commit locally, skip GitHub
 ```
 
 Or run it directly with `py upkg.py`.
 
-It prompts for:
+It asks for the package name, the account or org to create the repo under, visibility and
+license. Everything else is derived from the name:
 
-- **Repository**: name, owner (your account or any org you belong to), description,
-  visibility, license (from GitHub's license list), issues/wiki, topics
-- **Package**: display name, package name (`com.company.package`), folder under `Assets/`,
-  root namespace, version, Unity editor (detected from Unity Hub) and minimum Unity version,
-  author, keywords
+| | `Name Of Package` becomes |
+| --- | --- |
+| GitHub repo | `name-of-package` |
+| Display name | `Name Of Package` |
+| Package name | `com.radtaddev.nameofpackage` |
+| Package folder | `Assets/NameOfPackage` |
+| Namespace / assemblies | `RadTadDev.NameOfPackage` |
+
+The `com.radtaddev` / `RadTadDev` prefixes are constants at the top of `upkg.py`. The dev
+project is pinned to the newest Unity editor installed through Unity Hub.
 
 ## What it creates
 
 ```
 <repo>/
-├── .gitignore, .gitattributes, LICENSE, README.md
+├── .gitignore, LICENSE, README.md
 ├── ProjectSettings/ProjectVersion.txt     (pins the editor for Unity Hub)
 ├── Packages/manifest.json                 (editor defaults + Test Framework)
 └── Assets/
