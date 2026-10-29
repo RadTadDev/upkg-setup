@@ -748,6 +748,9 @@ def gather(args):
     user, owners = gh_owners()
     labels = [(o, f"{o} (personal)" if i == 0 else o) for i, o in enumerate(owners)]
     cfg["owner"] = choose("Create the repo under", labels)
+    if gh_json(f"repos/{cfg['owner']}/{cfg['repo']}") is not None:
+        die(f"https://github.com/{cfg['owner']}/{cfg['repo']} already exists. "
+            "Pick another name or owner, or delete that repo first.")
 
     cfg["visibility"] = choose("Visibility", [("private", "Private"), ("public", "Public")])
 
