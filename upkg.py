@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -26,6 +27,13 @@ PACKAGE_DOMAIN = "com.radtaddev"
 NAMESPACE_ROOT = "RadTadDev"
 INITIAL_VERSION = "0.1.0"
 UNITY_HUB_EDITOR_DIR = Path(r"C:\Program Files\Unity\Hub\Editor")
+
+# Shared C# style rules and CI check, copied into every repo and refreshed by `upkg style`.
+CS_STYLE_REPO = "https://github.com/RadTadDev/cs-style.git"
+# Files in cs-style that describe that repo itself rather than being part of the baseline.
+CS_STYLE_SKIP = {".git", ".gitignore", "README.md", "LICENSE"}
+# Records which cs-style commit and files a repo has, so `upkg style` can remove files dropped upstream.
+CS_STYLE_STAMP = ".cs-style.json"
 
 
 # ---------------------------------------------------------------------------
@@ -123,9 +131,13 @@ def gh_json(*endpoint_args):
         return None
 
 
-def require_tools():
+def require_git():
     if not shutil.which("git"):
         die("git was not found on PATH.")
+
+
+def require_tools():
+    require_git()
     if not shutil.which("gh"):
         die("GitHub CLI (gh) was not found on PATH. Install it from https://cli.github.com/")
     if run(["gh", "auth", "status"], check=False).returncode != 0:
@@ -292,13 +304,19 @@ GITIGNORE = """\
 /[Aa]ssets/[Ss]amples/
 /[Aa]ssets/[Ss]amples.meta
 
-# IDEs
+# Build output from the cs-style CI tools in ci/
+bin/
+obj/
+
+# IDEs (extensions.json comes from cs-style)
 .vs/
-.vscode/
+.vscode/*
+!.vscode/extensions.json
 .idea/
 .consulo/
 /[Aa]ssets/Plugins/Editor/JetBrains*
 *.csproj
+!/ci/**/*.csproj
 *.unityproj
 *.sln
 *.slnx
@@ -553,6 +571,82 @@ def write_repo(root, files):
 
 
 # ---------------------------------------------------------------------------
+# Code style (cs-style)
+# ---------------------------------------------------------------------------
+
+def _rmtree(path):
+    """shutil.rmtree that also removes git's read-only object files on Windows."""
+    def on_error(func, p, _):
+        os.chmod(p, 0o700)
+        func(p)
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=on_error)
+    else:
+        shutil.rmtree(path, onerror=on_error)
+
+
+def fetch_cs_style(ref=None):
+    """Shallow-clone cs-style. Returns (commit, {relative_path: bytes})."""
+    tmp = Path(tempfile.mkdtemp(prefix="upkg-cs-style-"))
+    try:
+        cmd = ["git", "clone", "--quiet", "--depth", "1"]
+        if ref:
+            cmd += ["--branch", ref]
+        run(cmd + [CS_STYLE_REPO, str(tmp / "repo")])
+        src = tmp / "repo"
+        commit = run(["git", "rev-parse", "HEAD"], cwd=src).stdout.strip()
+        files = {}
+        for dirpath, dirnames, filenames in os.walk(src):
+            here = Path(dirpath)
+            if here == src:
+                dirnames[:] = [d for d in dirnames if d not in CS_STYLE_SKIP]
+                filenames = [f for f in filenames if f not in CS_STYLE_SKIP]
+            for f in filenames:
+                files[(here / f).relative_to(src).as_posix()] = (here / f).read_bytes()
+        return commit, dict(sorted(files.items()))
+    finally:
+        _rmtree(tmp)
+
+
+def read_stamp(root):
+    try:
+        return json.loads((root / CS_STYLE_STAMP).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def apply_cs_style(root, commit, files, ref=None):
+    """Write the cs-style files into `root`, delete ones a previous version had but this
+    one doesn't, and update the stamp. Returns (added, changed, removed) path lists."""
+    old = set((read_stamp(root) or {}).get("files", []))
+    added, changed = [], []
+    for rel, data in files.items():
+        path = root / rel
+        if not path.exists():
+            added.append(rel)
+        elif path.read_bytes() != data:
+            changed.append(rel)
+        else:
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    removed = sorted(old - set(files))
+    for rel in removed:
+        path = root / rel
+        if path.is_file():
+            path.unlink()
+        # drop directories the removal left empty, up to the repo root
+        parent = path.parent
+        while parent != root and parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+            parent = parent.parent
+    stamp = {"source": CS_STYLE_REPO, "ref": ref, "commit": commit, "files": list(files)}
+    (root / CS_STYLE_STAMP).write_text(json.dumps(stamp, indent=2) + "\n",
+                                       encoding="utf-8", newline="\n")
+    return added, changed, removed
+
+
+# ---------------------------------------------------------------------------
 # Templates
 # ---------------------------------------------------------------------------
 
@@ -592,6 +686,25 @@ This repository is a Unity project. The package itself lives in
 
 Samples live in `{{pkg}}/Samples~` (hidden from Unity). To work on them, import them
 through the Package Manager or edit them outside the editor.
+
+## Code style
+
+C# style rules come from [cs-style](https://github.com/RadTadDev/cs-style): `.editorconfig`,
+`Directory.Build.props`, the `ci/` tools and `.github/workflows/style.yml`. Every push and pull
+request runs a non-blocking style check that reports findings as warnings. To pull the latest
+rules, run `upkg style` from the repository and commit the result. Edits to those files are
+overwritten on the next update.
+
+To check locally (needs the .NET SDK):
+
+```
+dotnet format whitespace ci/StyleCheck/StyleCheck.csproj --verify-no-changes
+dotnet format style ci/StyleCheck/StyleCheck.csproj --verify-no-changes
+dotnet run --project ci/DocCheck/DocCheck.csproj -- .
+```
+
+Drop `--verify-no-changes` to apply fixes (run `style` before `whitespace`). Naming and missing
+docs are not auto-fixed.
 
 ## Releasing
 
@@ -650,8 +763,14 @@ Describe how to use the package here.
 RUNTIME_CS = """\
 namespace {{ns}}
 {
+    /// <summary>
+    /// Information about the {{display}} package.
+    /// </summary>
     public static class {{cls}}Info
     {
+        /// <summary>
+        /// The package name, as listed in package.json.
+        /// </summary>
         public const string PackageName = "{{package_id}}";
     }
 }
@@ -663,6 +782,9 @@ using UnityEngine;
 
 namespace {{ns}}.Editor
 {
+    /// <summary>
+    /// Editor menu items for {{display}}.
+    /// </summary>
     public static class {{cls}}Menu
     {
         [MenuItem("Tools/{{display}}/About")]
@@ -679,8 +801,14 @@ using NUnit.Framework;
 
 namespace {{ns}}.Tests
 {
+    /// <summary>
+    /// Runtime tests for {{display}}.
+    /// </summary>
     public class {{cls}}Tests
     {
+        /// <summary>
+        /// The package name constant matches package.json.
+        /// </summary>
         [Test]
         public void PackageNameIsSet()
         {
@@ -695,8 +823,14 @@ using NUnit.Framework;
 
 namespace {{ns}}.Editor.Tests
 {
+    /// <summary>
+    /// Editor tests for {{display}}.
+    /// </summary>
     public class {{cls}}EditorTests
     {
+        /// <summary>
+        /// The editor assembly is referenced and loads.
+        /// </summary>
         [Test]
         public void EditorAssemblyLoads()
         {
@@ -711,6 +845,9 @@ using UnityEngine;
 
 namespace {{ns}}.Samples
 {
+    /// <summary>
+    /// Logs the package name when the scene starts.
+    /// </summary>
     public class ExampleUsage : MonoBehaviour
     {
         private void Start()
@@ -767,6 +904,9 @@ def gather(args):
                                                        cfg["display_name"])
                               if editor_dir else None)
 
+    # Fetched before confirming so a network or access problem stops us before anything is written.
+    cfg["cs_style"] = fetch_cs_style()
+
     year = datetime.date.today().year
     if cfg["license_key"]:
         cfg["license_spdx"], cfg["license_body"] = license_text(
@@ -787,6 +927,7 @@ def summarize(cfg):
         ("Package root", f"Assets/{cfg['folder']}"),
         ("Namespace", cfg["namespace"]),
         ("Unity", f"{cfg['unity_editor'] or 'unpinned'} (min {cfg['unity_min']})"),
+        ("Code style", f"cs-style @ {cfg['cs_style'][0][:7]}"),
         ("Local path", str(cfg["path"])),
     ]
     width = max(len(k) for k, _ in rows)
@@ -798,6 +939,7 @@ def create(cfg, args):
     root = cfg["path"]
     root.mkdir(parents=True)
     write_repo(root, build_files(cfg))
+    apply_cs_style(root, *cfg["cs_style"])
     run(["git", "init", "-b", "main"], cwd=root)
     run(["git", "add", "-A"], cwd=root)
     run(["git", "commit", "-m", f"Initial {cfg['display_name']} package structure"], cwd=root)
@@ -823,9 +965,82 @@ def create(cfg, args):
         info("Add the Test Framework package (Package Manager) so the test assemblies compile.")
 
 
+def unignore_cs_style(root, paths):
+    """Repos made by older upkg versions ignore *.csproj and .vscode/, which would keep
+    cs-style files out of git. Append exceptions to .gitignore for any that are ignored."""
+    def ignored(candidates):
+        proc = run(["git", "check-ignore", "--no-index", *candidates], cwd=root, check=False)
+        return proc.stdout.splitlines()
+
+    files = ignored(paths)
+    if not files:
+        return
+    # Git can't re-include a file inside an ignored directory, so re-include the directory
+    # and ignore its other contents instead (.vscode/ -> !/.vscode/ + /.vscode/*).
+    parents = sorted({str(Path(p).parent.as_posix()) + "/" for p in files} - {"./"})
+    lines = []
+    for d in ignored(parents) if parents else []:
+        lines += [f"!/{d}", f"/{d}*"]
+    lines += [f"!/{p}" for p in files]
+    gitignore = root / ".gitignore"
+    text = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += "\n# cs-style files (see upkg style)\n" + "".join(f"{line}\n" for line in lines)
+    gitignore.write_text(text, encoding="utf-8", newline="\n")
+    info(f"Un-ignored in .gitignore: {', '.join(files)}")
+    still = ignored(files)
+    if still:
+        info(f"Still ignored, fix .gitignore by hand: {', '.join(still)}")
+
+
+def style_command(argv):
+    parser = argparse.ArgumentParser(
+        prog="upkg style",
+        description="Re-pull the cs-style rules and CI check into the current repo.")
+    parser.add_argument("--ref", help="cs-style branch or tag to pull (default: its default branch, "
+                                      "or the ref this repo was last updated from)")
+    args = parser.parse_args(argv)
+
+    require_git()
+    proc = run(["git", "rev-parse", "--show-toplevel"], check=False)
+    if proc.returncode != 0:
+        die("Run `upkg style` from inside a repository.")
+    root = Path(proc.stdout.strip()).resolve()
+    stamp = read_stamp(root)
+    if stamp is None and not (root / "Assets").is_dir():
+        if not confirm(f"{root} doesn't look like a upkg repo. Add cs-style to it anyway?", False):
+            die("Aborted.", 0)
+    ref = args.ref or (stamp or {}).get("ref")
+
+    step(f"Fetching cs-style{f' ({ref})' if ref else ''}")
+    commit, files = fetch_cs_style(ref)
+    previous = (stamp or {}).get("commit")
+    info(f"{previous[:7] if previous else 'none'} -> {commit[:7]}")
+
+    added, changed, removed = apply_cs_style(root, commit, files, ref)
+    unignore_cs_style(root, list(files))
+    step("Done")
+    if not (added or changed or removed):
+        info("Already up to date.")
+        return
+    for label, paths in (("added", added), ("updated", changed), ("removed", removed)):
+        for rel in paths:
+            info(f"{label:<8} {rel}")
+    info("Review and commit the changes, e.g.:")
+    info(f'  git add -A && git commit -m "Update cs-style to {commit[:7]}"')
+
+
 def main():
     _enable_ansi()
+    if sys.argv[1:2] == ["style"]:
+        try:
+            style_command(sys.argv[2:])
+        except (KeyboardInterrupt, EOFError):
+            die("Aborted.", 130)
+        return
     parser = argparse.ArgumentParser(
+        epilog="Run `upkg style` inside a generated repo to re-pull the cs-style rules.",
         description="Create a GitHub repo pre-structured as a Unity package.")
     parser.add_argument("name", nargs="?", help='package name, e.g. "Name Of Package"')
     parser.add_argument("--unity", help="editor version to pin (default: newest installed)")
