@@ -431,8 +431,7 @@ def build_files(cfg):
     repo_url = f"https://github.com/{cfg['owner']}/{cfg['repo']}"
     blob = f"{repo_url}/blob/main/{pkg}"
     git_url = f"{repo_url}.git?path=/{pkg}"
-    cls = cfg["folder"]
-    v = dict(display=cfg["display_name"], ns=ns, cls=cls, package_id=cfg["package_id"],
+    v = dict(display=cfg["display_name"], ns=ns, package_id=cfg["package_id"],
              git_url=git_url, version=INITIAL_VERSION, unity=cfg["unity_min"],
              editor=cfg["unity_editor"] or cfg["unity_min"], pkg=pkg, short=short,
              date=datetime.date.today().isoformat())
@@ -448,11 +447,6 @@ def build_files(cfg):
         "changelogUrl": f"{blob}/CHANGELOG.md",
         "licensesUrl": f"{blob}/LICENSE.md",
         "dependencies": {},
-        "samples": [{
-            "displayName": "Example",
-            "description": "Minimal usage example.",
-            "path": "Samples~/Example",
-        }],
     }
     if cfg["license_spdx"]:
         manifest["license"] = cfg["license_spdx"]
@@ -467,20 +461,15 @@ def build_files(cfg):
         f"{pkg}/LICENSE.md": cfg["license_body"],
         f"{pkg}/Third Party Notices.md": render(THIRD_PARTY, **v),
         f"{pkg}/Runtime/{asm}.asmdef": asmdef(asm, ns),
-        f"{pkg}/Runtime/{cls}Info.cs": render(RUNTIME_CS, **v),
         f"{pkg}/Editor/{asm}.Editor.asmdef": asmdef(f"{asm}.Editor", f"{ns}.Editor", [asm],
                                                     editor_only=True),
-        f"{pkg}/Editor/{cls}Menu.cs": render(EDITOR_CS, **v),
         f"{pkg}/Tests/Runtime/{asm}.Tests.asmdef": asmdef(
             f"{asm}.Tests", f"{ns}.Tests",
             ["UnityEngine.TestRunner", "UnityEditor.TestRunner", asm], test=True),
-        f"{pkg}/Tests/Runtime/{cls}Tests.cs": render(RUNTIME_TEST_CS, **v),
         f"{pkg}/Tests/Editor/{asm}.Editor.Tests.asmdef": asmdef(
             f"{asm}.Editor.Tests", f"{ns}.Editor.Tests",
             ["UnityEngine.TestRunner", "UnityEditor.TestRunner", asm, f"{asm}.Editor"],
             editor_only=True, test=True),
-        f"{pkg}/Tests/Editor/{cls}EditorTests.cs": render(EDITOR_TEST_CS, **v),
-        f"{pkg}/Samples~/Example/ExampleUsage.cs": render(SAMPLE_CS, **v),
         f"{pkg}/Documentation~/{short}.md": render(DOCS_MD, **v),
     }
     if cfg["unity_editor"]:
@@ -684,8 +673,8 @@ This repository is a Unity project. The package itself lives in
 2. Commit the `Packages/` and `ProjectSettings/` folders Unity generates on first open.
 3. Run tests from **Window > General > Test Runner**.
 
-Samples live in `{{pkg}}/Samples~` (hidden from Unity). To work on them, import them
-through the Package Manager or edit them outside the editor.
+To ship samples, put them in `{{pkg}}/Samples~` (hidden from Unity) and list each one under
+`samples` in `package.json`. Import them through the Package Manager to work on them.
 
 ## Code style
 
@@ -725,7 +714,6 @@ PKG_README = """\
 | `Runtime/` | Runtime code (`{{ns}}`) |
 | `Editor/` | Editor-only code (`{{ns}}.Editor`) |
 | `Tests/Runtime`, `Tests/Editor` | Play mode and edit mode tests |
-| `Samples~/` | Importable samples (hidden from Unity) |
 | `Documentation~/` | Package documentation (hidden from Unity) |
 """
 
@@ -759,105 +747,6 @@ DOCS_MD = """\
 
 Describe how to use the package here.
 """
-
-RUNTIME_CS = """\
-namespace {{ns}}
-{
-    /// <summary>
-    /// Information about the {{display}} package.
-    /// </summary>
-    public static class {{cls}}Info
-    {
-        /// <summary>
-        /// The package name, as listed in package.json.
-        /// </summary>
-        public const string PackageName = "{{package_id}}";
-    }
-}
-"""
-
-EDITOR_CS = """\
-using UnityEditor;
-using UnityEngine;
-
-namespace {{ns}}.Editor
-{
-    /// <summary>
-    /// Editor menu items for {{display}}.
-    /// </summary>
-    public static class {{cls}}Menu
-    {
-        [MenuItem("Tools/{{display}}/About")]
-        private static void About()
-        {
-            Debug.Log($"{{{cls}}Info.PackageName}");
-        }
-    }
-}
-"""
-
-RUNTIME_TEST_CS = """\
-using NUnit.Framework;
-
-namespace {{ns}}.Tests
-{
-    /// <summary>
-    /// Runtime tests for {{display}}.
-    /// </summary>
-    public class {{cls}}Tests
-    {
-        /// <summary>
-        /// The package name constant matches package.json.
-        /// </summary>
-        [Test]
-        public void PackageNameIsSet()
-        {
-            Assert.AreEqual("{{package_id}}", {{cls}}Info.PackageName);
-        }
-    }
-}
-"""
-
-EDITOR_TEST_CS = """\
-using NUnit.Framework;
-
-namespace {{ns}}.Editor.Tests
-{
-    /// <summary>
-    /// Editor tests for {{display}}.
-    /// </summary>
-    public class {{cls}}EditorTests
-    {
-        /// <summary>
-        /// The editor assembly is referenced and loads.
-        /// </summary>
-        [Test]
-        public void EditorAssemblyLoads()
-        {
-            Assert.IsNotNull(typeof({{cls}}Menu));
-        }
-    }
-}
-"""
-
-SAMPLE_CS = """\
-using UnityEngine;
-
-namespace {{ns}}.Samples
-{
-    /// <summary>
-    /// Logs the package name when the scene starts.
-    /// </summary>
-    public class ExampleUsage : MonoBehaviour
-    {
-        private void Start()
-        {
-            Debug.Log($"Using {{{ns}}.{{cls}}Info.PackageName}");
-        }
-    }
-}
-"""
-
 
 # ---------------------------------------------------------------------------
 # Main flow

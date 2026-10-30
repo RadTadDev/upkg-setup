@@ -79,12 +79,11 @@ exceptions so the CI's `.csproj` files and `.vscode/extensions.json` get committ
     └── <PackageFolder>/                   (package root, installed via ?path=)
         ├── package.json
         ├── README.md, CHANGELOG.md, LICENSE.md, Third Party Notices.md
-        ├── Runtime/   <Ns>.asmdef, <Name>Info.cs
-        ├── Editor/    <Ns>.Editor.asmdef, <Name>Menu.cs
+        ├── Runtime/   <Ns>.asmdef
+        ├── Editor/    <Ns>.Editor.asmdef
         ├── Tests/
-        │   ├── Runtime/  <Ns>.Tests.asmdef, <Name>Tests.cs
-        │   └── Editor/   <Ns>.Editor.Tests.asmdef, <Name>EditorTests.cs
-        ├── Samples~/Example/ExampleUsage.cs
+        │   ├── Runtime/  <Ns>.Tests.asmdef
+        │   └── Editor/   <Ns>.Editor.Tests.asmdef
         └── Documentation~/<package>.md
 ```
 
