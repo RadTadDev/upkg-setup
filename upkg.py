@@ -705,7 +705,8 @@ request runs a non-blocking style check that reports findings as warnings. To pu
 rules, run `upkg style` from the repository and commit the result. Edits to those files are
 overwritten on the next update.
 
-To check locally (needs the .NET SDK):
+To check locally, run `upkg check` (needs the .NET 10 SDK). `upkg check --fix` applies the
+whitespace and style fixes first. Without `upkg`, run the checks directly:
 
 ```
 dotnet format whitespace ci/StyleCheck/StyleCheck.csproj --verify-no-changes
@@ -943,6 +944,209 @@ def style_command(argv):
             info(f"{label:<8} {rel}")
     info("Review and commit the changes, e.g.:")
     info(f'  git add -A && git commit -m "Update cs-style to {commit[:7]}"')
+    info("Run `upkg check` to see how the code does against the new rules.")
+
+
+# ---------------------------------------------------------------------------
+# Local style check
+# ---------------------------------------------------------------------------
+
+STYLE_PROJECT = "ci/StyleCheck/StyleCheck.csproj"
+DOC_PROJECT = "ci/DocCheck/DocCheck.csproj"
+# The checks from cs-style's .github/workflows/style.yml, in the same order. Each is
+# (title, tool, dotnet commands); every command before the last must succeed, and the last
+# one reports the findings.
+STYLE_CHECKS = [
+    ("Whitespace", "dotnet format whitespace",
+     [["format", "whitespace", STYLE_PROJECT, "--verify-no-changes"]]),
+    ("Style and naming", "dotnet format style",
+     [["format", "style", STYLE_PROJECT, "--verify-no-changes"]]),
+    ("Documentation and language version", "DocCheck",
+     [["build", DOC_PROJECT, "--nologo", "--verbosity", "quiet", "-p:UseSharedCompilation=false"],
+      ["run", "--project", DOC_PROJECT, "--no-build", "--", "."]]),
+]
+# A finding as dotnet format and DocCheck print it: path(line,col): severity ID: message [project]
+FINDING_RE = re.compile(r"^(?P<path>.+?)\((?P<line>\d+),(?P<col>\d+)\): (?P<sev>error|warning) "
+                        r"(?P<id>[A-Za-z0-9]+): (?P<msg>.*?)(?: \[[^\]]*\])?$")
+# Folders DocCheck skips at any depth (StyleCheck skips a subset). Used to spot what --fix changed.
+STYLE_SKIP_DIRS = {".git", "ci", "library", "temp", "logs", "usersettings", "obj", "bin"}
+
+
+def require_dotnet(root):
+    """The checks need the .NET SDK whose version DocCheck targets, the one CI installs."""
+    m = re.search(r"<TargetFramework>net(\d+)\.",
+                  (root / DOC_PROJECT).read_text(encoding="utf-8", errors="replace"))
+    major = m.group(1) if m else None
+    hint = (f"Install it with `winget install Microsoft.DotNet.SDK.{major}`, then open a new "
+            "terminal." if major else "Install it from https://dot.net, then open a new terminal.")
+    if not shutil.which("dotnet"):
+        die(f"dotnet was not found on PATH. The style checks need the .NET {major or ''} SDK. "
+            f"{hint}".replace("  ", " "))
+    if major:
+        sdks = run(["dotnet", "--list-sdks"], check=False).stdout.splitlines()
+        if not any(line.split(".", 1)[0].strip() == major for line in sdks):
+            die(f"The style checks need the .NET {major} SDK, the version CI uses. {hint}")
+
+
+def dotnet(root, *args):
+    """Run dotnet in `root`. Returns (exit code, output lines), stderr included."""
+    proc = run(["dotnet", *args], cwd=root, check=False)
+    return proc.returncode, (proc.stdout + proc.stderr).splitlines()
+
+
+def repo_relative(root, path):
+    p = Path(path)
+    if not p.is_absolute():
+        return p.as_posix()
+    try:
+        return p.resolve().relative_to(root).as_posix()
+    except (OSError, ValueError):
+        return path
+
+
+def parse_findings(root, lines):
+    """Findings in `lines`, deduplicated and sorted by file and position."""
+    found = {}
+    for line in lines:
+        m = FINDING_RE.match(line.strip())
+        if m:
+            f = dict(m.groupdict(), path=repo_relative(root, m["path"]),
+                     line=int(m["line"]), col=int(m["col"]))
+            found[(f["path"], f["line"], f["col"], f["id"], f["msg"])] = f
+    return [found[k] for k in sorted(found)]
+
+
+def format_finding(f):
+    return f"{f['path']}({f['line']},{f['col']}): {f['sev']} {f['id']}: {f['msg']}"
+
+
+def run_check(root, commands):
+    """Run one check. Returns (findings, None), or ([], output) when a command failed without
+    reporting findings, i.e. the tool itself didn't work."""
+    *setup, final = commands
+    for args in setup:
+        code, lines = dotnet(root, *args)
+        if code != 0:
+            return [], lines
+    code, lines = dotnet(root, *final)
+    findings = parse_findings(root, lines)
+    return findings, (lines if code != 0 and not findings else None)
+
+
+def crlf_normalized(root, paths):
+    """The subset of `paths` whose CRLF line endings git turns into LF when they're committed
+    (eol=lf in .gitattributes, and not already committed with CRLF). CI never sees those."""
+    out = git_text(root, "--literal-pathspecs", "ls-files", "-z", "--eol", "--cached", "--others",
+                   "--", *paths) or ""
+    normalized = set()
+    for entry in out.split("\0"):
+        details, _, path = entry.partition("\t")
+        fields = details.split()
+        if (any(f.endswith("eol=lf") for f in fields)
+                and not any(f in ("i/crlf", "i/mixed") for f in fields)):
+            normalized.add(path)
+    return normalized
+
+
+def cs_snapshot(root):
+    """Contents of the repo's .cs files, outside the folders the checks skip."""
+    files = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d.lower() not in STYLE_SKIP_DIRS]
+        for name in filenames:
+            if name.lower().endswith(".cs"):
+                path = Path(dirpath) / name
+                files[path.relative_to(root).as_posix()] = path.read_bytes()
+    return files
+
+
+def plural(n, word):
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def check_command(argv):
+    parser = argparse.ArgumentParser(
+        prog="upkg check",
+        description="Run the cs-style checks from the repo's style workflow (whitespace, style and "
+                    "naming, documentation) on the working tree, as CI would after you commit. "
+                    "Exits with 1 when there are findings.")
+    parser.add_argument("--fix", action="store_true",
+                        help="apply the whitespace and style fixes first, then check what's left")
+    args = parser.parse_args(argv)
+
+    require_git()
+    root = repo_root("check")
+    missing = [p for p in (STYLE_PROJECT, DOC_PROJECT) if not (root / p).is_file()]
+    if missing:
+        die(f"{root} has no {' or '.join(missing)}. Run `upkg style` to add the cs-style tools.")
+    require_dotnet(root)
+    os.environ.setdefault("DOTNET_NOLOGO", "true")
+    os.environ.setdefault("DOTNET_CLI_TELEMETRY_OPTOUT", "true")
+
+    if args.fix:
+        before = cs_snapshot(root)
+        # Style first: on Windows its fixes can insert CRLF, which the whitespace pass turns into LF.
+        for kind in ("style", "whitespace"):
+            step(f"Fixing {kind} (dotnet format {kind})")
+            code, lines = dotnet(root, "format", kind, STYLE_PROJECT)
+            if code != 0:
+                die(f"dotnet format {kind} failed:\n" + "\n".join(lines))
+        after = cs_snapshot(root)
+        changed = sorted(p for p in after if before.get(p) != after[p])
+        for rel in changed:
+            info(f"fixed    {rel}")
+        info("Review the changes with `git diff`." if changed else "Nothing to fix automatically.")
+
+    results = {}
+    crlf = set()
+    for title, tool, commands in STYLE_CHECKS:
+        step(f"{title} ({tool})")
+        findings, error = run_check(root, commands)
+        if error is not None:
+            info(f"{tool} failed to run:")
+            for line in error[-40:]:
+                info(f"  {line}")
+            results[title] = None
+            continue
+        eol_paths = sorted({f["path"] for f in findings if f["id"] == "ENDOFLINE"})
+        normalized = crlf_normalized(root, eol_paths) if eol_paths else set()
+        crlf |= normalized
+        findings = [f for f in findings if not (f["id"] == "ENDOFLINE" and f["path"] in normalized)]
+        for f in findings:
+            info(format_finding(f))
+        info(plural(len(findings), "finding") if findings else "clean")
+        results[title] = findings
+
+    step("Summary")
+    width = max(len(t) for t in results)
+    for title, findings in results.items():
+        status = ("failed to run" if findings is None
+                  else plural(len(findings), "finding") if findings else "clean")
+        info(f"{title:<{width}}  {status}")
+    if crlf:
+        print()
+        info(f"{plural(len(crlf), 'file')} with Windows (CRLF) line endings not counted: git "
+             "converts them to LF on commit, so CI won't report them."
+             + ("" if args.fix else " `upkg check --fix` converts them now."))
+        for rel in sorted(crlf):
+            info(f"  {rel}")
+
+    failed = [t for t, f in results.items() if f is None]
+    found = {t: f for t, f in results.items() if f}
+    if not failed and not found:
+        print()
+        info("All checks pass.")
+        return
+    fixable = found.keys() & {"Whitespace", "Style and naming"}
+    if fixable and not args.fix:
+        print()
+        info("`upkg check --fix` applies the whitespace and style fixes. Naming and missing docs "
+             "are not fixed automatically.")
+    elif found:
+        print()
+        info("Fix these by hand, or suppress them (see Suppressing a finding in the cs-style "
+             "README).")
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -1184,7 +1388,7 @@ def publish_command(argv):
 
 def main():
     _enable_ansi()
-    subcommands = {"style": style_command, "publish": publish_command}
+    subcommands = {"style": style_command, "check": check_command, "publish": publish_command}
     if sys.argv[1:2] and sys.argv[1] in subcommands:
         try:
             subcommands[sys.argv[1]](sys.argv[2:])
@@ -1195,10 +1399,12 @@ def main():
         prog="upkg",
         usage="%(prog)s [-h] [--unity UNITY] [--local] [-y] [name]\n"
               "       %(prog)s style [-h] [--ref REF]\n"
+              "       %(prog)s check [-h] [--fix]\n"
               "       %(prog)s publish [-h] [-y]",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="commands (run inside a generated repo):\n"
                "  style          re-pull the cs-style rules and CI check\n"
+               "  check          run the CI style checks locally (needs the .NET SDK)\n"
                "  publish        tag the last commit with its package version and push it\n"
                "\n"
                "Run `upkg <command> --help` for a command's options.",
