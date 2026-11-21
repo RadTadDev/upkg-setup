@@ -62,6 +62,11 @@ def die(msg, code=1):
     sys.exit(code)
 
 
+def warn_exit(msg, code=1):
+    print(f"\nwarning: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
 def ask(prompt, default=None, validate=None, allow_empty=False):
     """Prompt for a string. `validate` returns an error message or None."""
     suffix = f" [{default}]" if default not in (None, "") else ""
@@ -110,6 +115,8 @@ def choose(prompt, options, default=0):
 # ---------------------------------------------------------------------------
 
 def run(args, cwd=None, check=True, capture=True):
+    if not capture:
+        sys.stdout.flush()  # keep our output ahead of the child's when stdout is piped
     proc = subprocess.run(
         args, cwd=cwd, text=True, encoding="utf-8", errors="replace",
         stdout=subprocess.PIPE if capture else None,
@@ -119,6 +126,12 @@ def run(args, cwd=None, check=True, capture=True):
         detail = (proc.stderr or proc.stdout or "").strip() if capture else ""
         die(f"command failed: {' '.join(args)}\n{detail}")
     return proc
+
+
+def git_text(root, *args):
+    """stdout of a git command run in `root`, or None if it failed."""
+    proc = run(["git", *args], cwd=root, check=False)
+    return proc.stdout if proc.returncode == 0 else None
 
 
 def gh_json(*endpoint_args):
@@ -134,6 +147,14 @@ def gh_json(*endpoint_args):
 def require_git():
     if not shutil.which("git"):
         die("git was not found on PATH.")
+
+
+def repo_root(command):
+    """Top level of the repository the current directory is in."""
+    proc = run(["git", "rev-parse", "--show-toplevel"], check=False)
+    if proc.returncode != 0:
+        die(f"Run `upkg {command}` from inside a repository.")
+    return Path(proc.stdout.strip()).resolve()
 
 
 def require_tools():
@@ -699,7 +720,9 @@ docs are not auto-fixed.
 
 1. Bump `version` in [`{{pkg}}/package.json`]({{pkg}}/package.json).
 2. Move the `Unreleased` notes in [`CHANGELOG.md`]({{pkg}}/CHANGELOG.md) under the new version.
-3. Commit, then tag and push: `git tag v<version> && git push --tags`.
+3. Commit both in one commit, then run `upkg publish`. It checks the version went up and the
+   changelog has the new entry, then tags the commit `v<version>` and pushes it. (By hand:
+   `git tag v<version> && git push origin HEAD v<version>`.)
 """
 
 PKG_README = """\
@@ -892,10 +915,7 @@ def style_command(argv):
     args = parser.parse_args(argv)
 
     require_git()
-    proc = run(["git", "rev-parse", "--show-toplevel"], check=False)
-    if proc.returncode != 0:
-        die("Run `upkg style` from inside a repository.")
-    root = Path(proc.stdout.strip()).resolve()
+    root = repo_root("style")
     stamp = read_stamp(root)
     if stamp is None and not (root / "Assets").is_dir():
         if not confirm(f"{root} doesn't look like a upkg repo. Add cs-style to it anyway?", False):
@@ -920,16 +940,255 @@ def style_command(argv):
     info(f'  git add -A && git commit -m "Update cs-style to {commit[:7]}"')
 
 
+# ---------------------------------------------------------------------------
+# Publishing
+# ---------------------------------------------------------------------------
+
+# SemVer 2.0.0 (https://semver.org), which Unity requires for package versions.
+_SEMVER_ID = r"(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+SEMVER_RE = re.compile(
+    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    rf"(?:-({_SEMVER_ID}(?:\.{_SEMVER_ID})*))?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$")
+# Version headings in a Keep a Changelog file, e.g. "## [1.2.0] - 2024-01-31".
+CHANGELOG_ENTRY_RE = re.compile(r"^##[ \t]+\[?v?([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+-]*)\]?",
+                                re.MULTILINE)
+RELEASE_TAG_PREFIX = "v"
+
+
+def semver_key(version):
+    """Sort key giving SemVer precedence (build metadata ignored), or None if not SemVer."""
+    m = SEMVER_RE.match(version or "")
+    if not m:
+        return None
+    core = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    if m.group(4) is None:
+        return core + (1, ())  # a release outranks its pre-releases
+    ids = tuple((0, int(p), "") if p.isdigit() else (1, 0, p) for p in m.group(4).split("."))
+    return core + (0, ids)
+
+
+def tag_version_key(tag):
+    """semver_key of a release tag like v1.2.0, or None for any other tag."""
+    if not tag.startswith(RELEASE_TAG_PREFIX):
+        return None
+    return semver_key(tag[len(RELEASE_TAG_PREFIX):])
+
+
+def changelog_entries(text):
+    return set(CHANGELOG_ENTRY_RE.findall(text or ""))
+
+
+def parse_manifest(text):
+    try:
+        data = json.loads((text or "").lstrip("﻿"))
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def find_package(root):
+    """Repo-relative path of the package root, Assets/<PackageFolder>."""
+    found = sorted(p.parent.relative_to(root).as_posix()
+                   for p in root.glob("Assets/*/package.json"))
+    if not found:
+        die(f"No Assets/<Package>/package.json in {root}. "
+            "Run `upkg publish` from a repo made by upkg.")
+    if len(found) > 1:
+        die(f"Found more than one package ({', '.join(found)}), not sure which to publish.")
+    return found[0]
+
+
+def github_https_url(remote_url):
+    m = re.match(r"^(?:https?://(?:[^@/]+@)?|ssh://git@|git@)github\.com[:/]"
+                 r"([^/]+)/(.+?)(?:\.git)?/?$", remote_url)
+    return f"https://github.com/{m.group(1)}/{m.group(2)}" if m else None
+
+
+def publish_command(argv):
+    parser = argparse.ArgumentParser(
+        prog="upkg publish",
+        description="Tag the last commit with the package version and push it. The commit must "
+                    "raise the version in package.json and add a CHANGELOG.md entry for it.")
+    parser.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
+    args = parser.parse_args(argv)
+
+    require_git()
+    root = repo_root("publish")
+
+    remotes = (git_text(root, "remote") or "").split()
+    if not remotes:
+        die(f"`upkg publish` isn't supported in a local repo: {root} has no remote to push to.\n"
+            "Create the GitHub repo first (this also pushes your commits), then run it again:\n"
+            f"  gh repo create <owner>/{root.name} --private --source . --remote origin --push")
+
+    branch = (git_text(root, "symbolic-ref", "--quiet", "--short", "HEAD") or "").strip()
+    if not branch:
+        die("HEAD is detached. Check out the branch to release from, then run `upkg publish`.")
+    head = (git_text(root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}") or "").strip()
+    if not head:
+        die("Nothing is committed yet.")
+
+    # Push where `git push` would: the branch's upstream, else origin (or the only remote).
+    upstream = (git_text(root, "config", f"branch.{branch}.remote") or "").strip()
+    if upstream in remotes:
+        remote = upstream
+        remote_ref = ((git_text(root, "config", f"branch.{branch}.merge") or "").strip()
+                      or f"refs/heads/{branch}")
+    elif "origin" in remotes or len(remotes) == 1:
+        remote = "origin" if "origin" in remotes else remotes[0]
+        remote_ref = f"refs/heads/{branch}"
+    else:
+        die(f"{branch} has no upstream and there are several remotes ({', '.join(remotes)}). "
+            f"Push it once with `git push -u <remote> {branch}`, then run `upkg publish` again.")
+    remote_branch = remote_ref[len("refs/heads/"):] if remote_ref.startswith("refs/heads/") \
+        else remote_ref
+
+    # The tag goes on the last commit, so the package must be fully committed.
+    pkg = find_package(root)
+    dirty = (git_text(root, "status", "--porcelain", "--untracked-files=all", "--", pkg)
+             or "").splitlines()
+    if dirty:
+        listing = "\n".join(f"  {line}" for line in dirty[:10])
+        if len(dirty) > 10:
+            listing += f"\n  ... and {len(dirty) - 10} more"
+        die(f"{pkg} has uncommitted changes. Commit them first, since publish tags the last "
+            f"commit:\n{listing}")
+
+    def at(rev, rel):
+        return git_text(root, "cat-file", "blob", f"{rev}:{rel}") if rev else None
+
+    manifest_rel, changelog_rel = f"{pkg}/package.json", f"{pkg}/CHANGELOG.md"
+    parent = (git_text(root, "rev-parse", "--verify", "--quiet", "HEAD~1^{commit}")
+              or "").strip() or None
+    manifest = parse_manifest(at("HEAD", manifest_rel))
+    version = manifest.get("version")
+    prev_version = parse_manifest(at(parent, manifest_rel)).get("version")
+    if not isinstance(version, str) or not version:
+        die(f"{manifest_rel} has no version.")
+    key = semver_key(version)
+    if key is None:
+        die(f"Version '{version}' in {manifest_rel} isn't a SemVer version like 1.2.0.")
+
+    # Checks against the previous commit: the version went up and the changelog gained its entry.
+    if version == prev_version:
+        warn_exit(f"The version is still {version}, the same as in the previous commit. Bump "
+                  f"`version` in {manifest_rel}, commit it with its CHANGELOG.md entry, and run "
+                  "`upkg publish` again.")
+    prev_key = semver_key(prev_version) if isinstance(prev_version, str) else None
+    if prev_key is not None and key <= prev_key:
+        die(f"The version must increase: the previous commit has {prev_version}, "
+            f"this one {version}.")
+    changelog = at("HEAD", changelog_rel)
+    if version not in changelog_entries(changelog):
+        warn_exit(f"{changelog_rel} has no entry for {version}. Add a `## [{version}] - "
+                  f"{datetime.date.today().isoformat()}` section, commit it, and run "
+                  "`upkg publish` again.")
+    if version in changelog_entries(at(parent, changelog_rel)):
+        warn_exit(f"{changelog_rel} has no new entry: the {version} entry was already in the "
+                  "previous commit. Publish expects the version bump and its changelog entry in "
+                  "the last commit.")
+
+    tag = f"{RELEASE_TAG_PREFIX}{version}"
+    url = (git_text(root, "remote", "get-url", remote) or "").strip()
+    step(f"Checking {remote}")
+    proc = run(["git", "ls-remote", remote, remote_ref, "refs/tags/*"], cwd=root, check=False)
+    if proc.returncode != 0:
+        die(f"Couldn't read {remote} ({url}):\n{(proc.stderr or '').strip()}")
+    remote_head, remote_tags = None, {}
+    for line in proc.stdout.splitlines():
+        sha, _, ref = line.partition("\t")
+        if ref == remote_ref:
+            remote_head = sha
+        elif ref.startswith("refs/tags/"):
+            name = ref[len("refs/tags/"):]
+            if name.endswith("^{}"):
+                remote_tags[name[:-3]] = sha  # the commit an annotated tag points at
+            else:
+                remote_tags.setdefault(name, sha)
+
+    if tag in remote_tags:
+        where = "this commit" if remote_tags[tag] == head else f"commit {remote_tags[tag][:7]}"
+        warn_exit(f"{tag} is already published on {remote}, at {where}. Bump the version to "
+                  "publish a new release.")
+    local_tag_commit = (git_text(root, "rev-parse", "--verify", "--quiet",
+                                 f"refs/tags/{tag}^{{commit}}") or "").strip() or None
+    if local_tag_commit and local_tag_commit != head:
+        die(f"A local tag {tag} already exists on commit {local_tag_commit[:7]}, not this one. "
+            f"Delete it with `git tag -d {tag}` or bump the version.")
+    already_tagged = local_tag_commit == head  # tagged by hand or by an interrupted publish
+
+    local_tags = (git_text(root, "tag", "--list") or "").split()
+    releases = [t for t in set(local_tags) | set(remote_tags)
+                if t != tag and tag_version_key(t) is not None]
+    latest = max(releases, key=tag_version_key, default=None)
+    if latest and tag_version_key(latest) >= key:
+        die(f"The version must increase: {latest} is already tagged, and {version} isn't higher.")
+
+    if remote_head and remote_head != head and run(
+            ["git", "merge-base", "--is-ancestor", remote_head, head],
+            cwd=root, check=False).returncode != 0:
+        die(f"{remote}/{remote_branch} has commits that aren't in {branch}. Run "
+            "`git pull --rebase`, check the release commit is still the last one, and run "
+            "`upkg publish` again.")
+
+    step("Publish")
+    subject = (git_text(root, "log", "-1", "--format=%s", "HEAD") or "").strip()
+    rows = [
+        ("Package", f"{manifest.get('name') or '?'} ({pkg})"),
+        ("Version", f"{prev_version or 'none'} -> {version} (previous commit -> this one)"),
+        ("Last tag", latest or "none"),
+        ("Tag", f"{tag} on {head[:7]} \"{subject}\""),
+        ("Push to", f"{remote} ({url}), branch {remote_branch}"),
+    ]
+    width = max(len(k) for k, _ in rows)
+    for k, val in rows:
+        info(f"{k:<{width}}  {val}")
+    other = (git_text(root, "status", "--porcelain", "--", ".", f":(exclude){pkg}")
+             or "").splitlines()
+    if other:
+        info(f"Note: {len(other)} uncommitted change(s) outside {pkg} won't be pushed.")
+    if not args.yes and not confirm(f"\nTag {tag} and push it to {remote}?", True):
+        die("Aborted.", 0)
+
+    if already_tagged:
+        info(f"{tag} is already tagged locally on this commit; pushing it.")
+    else:
+        display = manifest.get("displayName") or manifest.get("name") or pkg
+        run(["git", "tag", "-a", tag, "-m", f"{display} {version}"], cwd=root)
+
+    step(f"Pushing to {remote}")
+    # Atomic, so the remote never gets the tag without the branch (or the other way around).
+    push = ["git", "push", "--atomic", remote, f"refs/heads/{branch}:{remote_ref}",
+            f"refs/tags/{tag}"]
+    if run(push, cwd=root, check=False, capture=False).returncode != 0:
+        undo = ""
+        if not already_tagged:
+            run(["git", "tag", "-d", tag], cwd=root, check=False)
+            undo = f" and the local {tag} tag was removed"
+        die(f"Push failed, so nothing was published{undo}. Fix the problem above and run "
+            "`upkg publish` again.")
+
+    step("Done")
+    info(f"Published {tag} to {remote}/{remote_branch}.")
+    web = github_https_url(url)
+    if web:
+        info(f"Release:     {web}/tree/{tag}")
+        info(f"Install URL: {web}.git?path=/{pkg}#{tag}")
+
+
 def main():
     _enable_ansi()
-    if sys.argv[1:2] == ["style"]:
+    subcommands = {"style": style_command, "publish": publish_command}
+    if sys.argv[1:2] and sys.argv[1] in subcommands:
         try:
-            style_command(sys.argv[2:])
+            subcommands[sys.argv[1]](sys.argv[2:])
         except (KeyboardInterrupt, EOFError):
             die("Aborted.", 130)
         return
     parser = argparse.ArgumentParser(
-        epilog="Run `upkg style` inside a generated repo to re-pull the cs-style rules.",
+        epilog="Inside a generated repo, run `upkg style` to re-pull the cs-style rules or "
+               "`upkg publish` to tag and push a release.",
         description="Create a GitHub repo pre-structured as a Unity package.")
     parser.add_argument("name", nargs="?", help='package name, e.g. "Name Of Package"')
     parser.add_argument("--unity", help="editor version to pin (default: newest installed)")
