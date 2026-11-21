@@ -43,6 +43,10 @@ license. Everything else is derived from the name:
 The `com.radtaddev` / `RadTadDev` prefixes are constants at the top of `upkg.py`. The dev
 project is pinned to the newest Unity editor installed through Unity Hub.
 
+The author in `package.json` and the license's copyright holder is the org when the repo goes
+under one (its GitHub display name, or its login if it has none). For a repo under your own
+account it's your GitHub name, or your login if your profile has no name.
+
 ## Code style
 
 Every repo gets the C# style baseline from [cs-style](https://github.com/RadTadDev/cs-style)

@@ -810,7 +810,11 @@ def gather(args):
     cfg["unity_editor"], editor_dir = pick_unity_editor(args.unity)
     cfg["unity_min"] = (".".join(cfg["unity_editor"].split(".")[:2])
                         if cfg["unity_editor"] else "2022.3")
-    cfg["author_name"] = user.get("name") or cfg["owner"]
+    # package.json author and license holder: the org when the repo goes under one, else you.
+    if cfg["owner"] == user["login"]:
+        cfg["author_name"] = user.get("name") or user["login"]
+    else:
+        cfg["author_name"] = (gh_json(f"orgs/{cfg['owner']}") or {}).get("name") or cfg["owner"]
     cfg["project_manifest"] = default_project_manifest(editor_dir) if editor_dir else None
     cfg["player_settings"] = (template_player_settings(editor_dir, NAMESPACE_ROOT,
                                                        cfg["display_name"])
@@ -834,6 +838,7 @@ def summarize(cfg):
     rows = [
         ("Repository", f"{cfg['owner']}/{cfg['repo']} ({cfg['visibility']})"),
         ("License", cfg["license_spdx"] or "none"),
+        ("Author", cfg["author_name"]),
         ("Package", cfg["package_id"]),
         ("Display name", cfg["display_name"]),
         ("Package root", f"Assets/{cfg['folder']}"),
