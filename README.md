@@ -10,9 +10,10 @@ and publishes it to GitHub with `gh`.
 
 - Windows, Python 3.8+ (standard library only)
 - `git`, with access to the cs-style repo
-- [GitHub CLI](https://cli.github.com/), logged in (`gh auth login`); not needed for `upkg style`
-  or `upkg publish`
-- Optional: .NET SDK 8+ to run the style checks locally (see the generated README)
+- [GitHub CLI](https://cli.github.com/), logged in (`gh auth login`); not needed for `upkg style`,
+  `upkg check` or `upkg publish`
+- For `upkg check` only: the .NET 10 SDK (`winget install Microsoft.DotNet.SDK.10`), the version
+  the CI style check uses
 
 ## Usage
 
@@ -24,6 +25,7 @@ upkg "Name Of Package"
 upkg --unity 6000.0.23f1   # pin a specific editor instead of the newest installed
 upkg --local               # create + commit locally, don't create the GitHub repo yet
 upkg style                 # inside a generated repo: re-pull the cs-style rules
+upkg check                 # inside a generated repo: run the CI style checks locally
 upkg publish               # inside a generated repo: tag the release and push it
 ```
 
@@ -42,6 +44,10 @@ license. Everything else is derived from the name:
 
 The `com.radtaddev` / `RadTadDev` prefixes are constants at the top of `upkg.py`. The dev
 project is pinned to the newest Unity editor installed through Unity Hub.
+
+The author in `package.json` and the license's copyright holder is the org when the repo goes
+under one (its GitHub display name, or its login if it has none). For a repo under your own
+account it's your GitHub name, or your login if your profile has no name.
 
 ## Code style
 
@@ -62,8 +68,28 @@ It overwrites the cs-style files with the latest version, deletes files cs-style
 and lists what changed for you to review and commit. `.cs-style.json` records the commit and
 files that were applied. In repos made before this existed, it also adds `.gitignore`
 exceptions so the CI's `.csproj` files and `.vscode/extensions.json` get committed. Because
-`style` and `publish` are subcommands, a package literally named "Style" or "Publish" has to be
-entered at the prompt.
+`style`, `check` and `publish` are subcommands, a package literally named "Style", "Check" or
+"Publish" has to be entered at the prompt.
+
+### Checking locally
+
+To see what the CI style check will report before you push, run from anywhere inside the repo:
+
+```
+upkg check
+upkg check --fix           # apply the whitespace and style fixes first, then check what's left
+```
+
+It runs the same three checks as the workflow on your working tree (whitespace, style and
+naming, and documentation plus language version) and lists each finding as
+`path(line,col): severity ID: message`, followed by a summary. It exits with 1 when there are
+findings, so it can run from a git hook. Naming and missing docs aren't fixed by `--fix`. It
+needs the .NET SDK version that `ci/DocCheck` targets, the same one CI installs (10 for now).
+
+On Windows, files that Unity or an editor saved with CRLF line endings aren't counted: the
+`.gitattributes` from cs-style makes git convert them to LF on commit, so CI never sees them.
+`upkg check` lists them separately, and `--fix` converts them. A file that was already
+committed with CRLF is still reported, because CI checks the committed copy.
 
 ## Publishing a release
 
