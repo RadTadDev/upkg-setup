@@ -1187,8 +1187,16 @@ def main():
             die("Aborted.", 130)
         return
     parser = argparse.ArgumentParser(
-        epilog="Inside a generated repo, run `upkg style` to re-pull the cs-style rules or "
-               "`upkg publish` to tag and push a release.",
+        prog="upkg",
+        usage="%(prog)s [-h] [--unity UNITY] [--local] [-y] [name]\n"
+              "       %(prog)s style [-h] [--ref REF]\n"
+              "       %(prog)s publish [-h] [-y]",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="commands (run inside a generated repo):\n"
+               "  style          re-pull the cs-style rules and CI check\n"
+               "  publish        tag the last commit with its package version and push it\n"
+               "\n"
+               "Run `upkg <command> --help` for a command's options.",
         description="Create a GitHub repo pre-structured as a Unity package.")
     parser.add_argument("name", nargs="?", help='package name, e.g. "Name Of Package"')
     parser.add_argument("--unity", help="editor version to pin (default: newest installed)")
